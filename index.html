@@ -242,18 +242,26 @@ const store = (()=>{ try{ localStorage.setItem("__t","1"); localStorage.removeIt
   return {get:k=>localStorage.getItem(k), set:(k,v)=>localStorage.setItem(k,v), del:k=>localStorage.removeItem(k)};
  }catch(e){ const m={}; return {get:k=>m[k]??null, set:(k,v)=>{m[k]=v;}, del:k=>{delete m[k];}}; } })();
 
-let vagas = [];                       // lista compartilhada [{id,titulo,desc,link}]
-let enviados = {};                    // progresso da Sara (local do aparelho) {id:true}
+let vagas = [];                       // lista compartilhada [{id,titulo,desc,link,enviado}]
 try{ vagas = JSON.parse(store.get("sara_vagas_v2")||"[]"); }catch(e){}
-try{ enviados = JSON.parse(store.get("sara_enviados")||"{}"); }catch(e){}
-/* migração da versão antiga */
+/* migração da versão antiga (vaga.enviado já vinha embutido) */
 try{ const old=JSON.parse(store.get("sara_vagas")||"null");
-  if(old && !vagas.length){ vagas=old.map(v=>({id:v.id,titulo:v.titulo,desc:v.desc,link:v.link}));
-    old.forEach(v=>{ if(v.enviado) enviados[v.id]=true; }); saveLocal(); } }catch(e){}
+  if(old && !vagas.length){
+    vagas=old.map(v=>({id:v.id,titulo:v.titulo,desc:v.desc,link:v.link,enviado:!!v.enviado}));
+    saveLocal();
+  } }catch(e){}
+/* migração do progresso que ficava só neste aparelho (versão anterior à sincronização):
+   soma o que faltava sincronizar, nunca desmarca o que já era true */
+function mergeEnviados(list, flags){
+  let changed=false;
+  list.forEach(v=>{ if(flags[v.id] && !v.enviado){ v.enviado=true; changed=true; } });
+  return changed;
+}
+try{ const legacy=JSON.parse(store.get("sara_enviados")||"{}");
+  if(mergeEnviados(vagas, legacy)) saveLocal(); }catch(e){}
 
-function saveLocal(){ store.set("sara_vagas_v2", JSON.stringify(vagas));
-                      store.set("sara_enviados", JSON.stringify(enviados)); }
-const sentCount = ()=>vagas.filter(v=>enviados[v.id]).length;
+function saveLocal(){ store.set("sara_vagas_v2", JSON.stringify(vagas)); }
+const sentCount = ()=>vagas.filter(v=>v.enviado).length;
 
 /* ================= sincronização via GitHub ================= */
 function detectRepo(){
@@ -289,33 +297,49 @@ async function remoteGet(){
   const j = await r.json();
   return {list: JSON.parse(utf8b64(j.content)), sha: j.sha};
 }
+/* funde a lista remota (fonte da verdade para criação/edição/exclusão de vaga)
+   com o "enviado" que só existe localmente ainda — nunca perde um envio já marcado
+   neste aparelho, mesmo que o servidor não saiba dele ainda */
+function mergeVagaLists(remoteList, localList){
+  const localById = Object.fromEntries(localList.map(v=>[v.id,v]));
+  const remoteIds = new Set(remoteList.map(v=>v.id));
+  const merged = remoteList.map(rv=>{
+    const lv = localById[rv.id];
+    return (lv && lv.enviado && !rv.enviado) ? {...rv, enviado:true} : rv;
+  });
+  const localOnly = localList.filter(lv=>!remoteIds.has(lv.id));
+  return [...localOnly, ...merged];
+}
 async function remotePut(list){
-  const {sha} = await remoteGet();
+  const {list:remoteList, sha} = await remoteGet();
+  const merged = remoteList ? mergeVagaLists(remoteList, list) : list;
   const body = {message:"vagas: atualização pelo adm",
-                content: b64utf8(JSON.stringify(list, null, 1))};
+                content: b64utf8(JSON.stringify(merged, null, 1))};
   if(sha) body.sha = sha;
   const r = await fetch(apiURL(CFG), {method:"PUT",
     headers:{Authorization:"Bearer "+CFG.token, Accept:"application/vnd.github+json",
              "Content-Type":"application/json"},
     body: JSON.stringify(body)});
   if(!r.ok) throw new Error("HTTP "+r.status);
+  return merged;
 }
 async function pullVagas(silent){
   if(!CFG){ return false; }
   try{
     const {list} = await remoteGet();
-    if(list){ vagas = list; saveLocal(); drawCards(); drawAdmin(); render(); }
+    if(list){ vagas = mergeVagaLists(list, vagas); saveLocal(); drawCards(); drawAdmin(); render(); }
     if(!silent) toast("Mural atualizado ☁");
     return true;
   }catch(e){ if(!silent) toast("Sem conexão com o repositório 😕"); return false; }
 }
-async function pushVagas(){
+async function pushVagas(successMsg){
   saveLocal(); drawCards(); drawAdmin(); render();
   if(CFG && CFG.token){
-    try{ await remotePut(vagas); toast("Publicado no Mural ☁"); }
+    try{ vagas = await remotePut(vagas); saveLocal(); drawCards(); drawAdmin(); render();
+      toast(successMsg || "Publicado no Mural ☁"); }
     catch(e){ toast("Salvo aqui, mas falhou no GitHub ("+e.message+")"); }
   } else {
-    toast("Salvo neste aparelho (configure o token para sincronizar)");
+    toast(successMsg || "Salvo neste aparelho (configure o token para sincronizar)");
   }
 }
 
@@ -399,7 +423,10 @@ document.getElementById("cfgSave").onclick=()=>{
   if(!m){ toast("Formato: usuário/repositório"); return; }
   CFG={owner:m[1], repo:m[2], token:tk};
   store.set("sara_repo_cfg", JSON.stringify(CFG));
-  syncStatusMsg(); toast("Configuração salva ✔"); pullVagas(true);
+  syncStatusMsg(); toast("Configuração salva ✔");
+  /* puxa o mural (mesclando com o que já existe aqui) e, tendo token,
+     já publica de volta — o progresso deste aparelho fica durável na hora */
+  pullVagas(true).then(()=>{ if(CFG.token) pushVagas(); });
 };
 
 /* adm: publicar e excluir */
@@ -408,7 +435,8 @@ document.getElementById("aAdd").onclick=()=>{
   if(!t){ toast("Dê um título à vaga 🙂"); return; }
   vagas.unshift({id:Date.now(), titulo:t,
     desc:document.getElementById("aDesc").value.trim(),
-    link:document.getElementById("aLink").value.trim()});
+    link:document.getElementById("aLink").value.trim(),
+    enviado:false});
   ["aTitle","aDesc","aLink"].forEach(i=>document.getElementById(i).value="");
   pushVagas();
 };
@@ -462,12 +490,14 @@ function drawCards(){
     const row=document.createElement("div"); row.className="btns";
     const b1=document.createElement("button"); b1.className="y2k-btn b-link";
     b1.textContent="Copiar Link"; b1.onclick=()=>copyLink(v.link); row.appendChild(b1);
-    const sent=!!enviados[v.id];
+    const sent=!!v.enviado;
     const b2=document.createElement("button"); b2.className="y2k-btn b-send"+(sent?" sent":"");
     b2.textContent=sent?"Currículo Enviado!!":"Currículo Enviado?";
-    b2.onclick=()=>{ if(enviados[v.id]) delete enviados[v.id]; else enviados[v.id]=true;
-      saveLocal(); drawCards(); render();
-      if(enviados[v.id])toast(sentCount()>=30?"🌻 AUGE ALCANÇADO!":"+1 pro girassol! 🌻"); };
+    b2.onclick=()=>{
+      v.enviado = !v.enviado;
+      const msg = v.enviado ? (sentCount()>=30?"🌻 AUGE ALCANÇADO!":"+1 pro girassol! 🌻") : null;
+      pushVagas(msg);
+    };
     row.appendChild(b2); c.appendChild(row);
     cardsEl.appendChild(c);
   });
